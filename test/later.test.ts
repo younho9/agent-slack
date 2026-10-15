@@ -9,16 +9,22 @@ import {
 } from "../src/slack/later.ts";
 import type { SlackApiClient } from "../src/slack/client.ts";
 
-function createClient(responses: Record<string, Record<string, unknown>>) {
+type MockResponse =
+  | Record<string, unknown>
+  | ((params: Record<string, unknown>) => Record<string, unknown>);
+
+function createClient(responses: Record<string, MockResponse>) {
   const calls: { method: string; params: Record<string, unknown>; multipart?: boolean }[] = [];
   const client = {
     api: async (method: string, params: Record<string, unknown> = {}) => {
       calls.push({ method, params });
-      return responses[method] ?? { ok: true };
+      const r = responses[method];
+      return (typeof r === "function" ? r(params) : r) ?? { ok: true };
     },
     apiMultipart: async (method: string, params: Record<string, unknown> = {}) => {
       calls.push({ method, params, multipart: true });
-      return responses[method] ?? { ok: true };
+      const r = responses[method];
+      return (typeof r === "function" ? r(params) : r) ?? { ok: true };
     },
   } as unknown as SlackApiClient;
   return { client, calls };
@@ -53,6 +59,7 @@ describe("fetchLaterItems", () => {
     expect(calls[0]?.method).toBe("saved.list");
     expect(result.counts).toEqual({
       in_progress: 5,
+      todo: 0,
       archived: 1,
       completed: 10,
       total: 16,
@@ -60,7 +67,7 @@ describe("fetchLaterItems", () => {
     expect(result.items).toHaveLength(0);
   });
 
-  test("filters to message items only", async () => {
+  test("lists messages and standalone reminder To-dos, skipping other types", async () => {
     const { client } = createClient({
       "saved.list": {
         ok: true,
@@ -68,9 +75,18 @@ describe("fetchLaterItems", () => {
           {
             item_id: "Sa123",
             item_type: "reminder",
-            ts: "",
             state: "in_progress",
+            todo_state: "in_progress",
             date_created: 100,
+            date_due: 500,
+            description: [
+              {
+                type: "rich_text",
+                elements: [
+                  { type: "rich_text_section", elements: [{ type: "text", text: "write report" }] },
+                ],
+              },
+            ],
           },
           {
             item_id: "C123",
@@ -79,6 +95,7 @@ describe("fetchLaterItems", () => {
             state: "in_progress",
             date_created: 200,
           },
+          { item_id: "F1", item_type: "file", state: "in_progress", date_created: 300 },
         ],
         counts: { uncompleted_count: 2, archived_count: 0, completed_count: 0, total_count: 2 },
       },
@@ -91,68 +108,73 @@ describe("fetchLaterItems", () => {
 
     const result = await fetchLaterItems(client);
 
-    expect(result.items).toHaveLength(1);
-    expect(result.items[0]?.channel_id).toBe("C123");
-  });
-
-  test("filters by state", async () => {
-    const { client } = createClient({
-      "saved.list": {
-        ok: true,
-        saved_items: [
-          {
-            item_id: "C1",
-            item_type: "message",
-            ts: "1.1",
-            state: "in_progress",
-            date_created: 100,
-          },
-          {
-            item_id: "C2",
-            item_type: "message",
-            ts: "2.2",
-            state: "completed",
-            date_created: 200,
-            date_completed: 300,
-          },
-          { item_id: "C3", item_type: "message", ts: "3.3", state: "archived", date_created: 150 },
-        ],
-        counts: { uncompleted_count: 1, archived_count: 1, completed_count: 1, total_count: 3 },
-      },
-      "conversations.info": { ok: true, channel: { name: "test" } },
-      "conversations.history": { ok: true, messages: [{ ts: "2.2", text: "done", user: "U1" }] },
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0]).toMatchObject({
+      item_type: "reminder",
+      todo_state: "in_progress",
+      date_due: 500,
+      message: { content: "write report" },
     });
-
-    const result = await fetchLaterItems(client, { state: "completed" });
-
-    expect(result.items).toHaveLength(1);
-    expect(result.items[0]?.state).toBe("completed");
-    expect(result.items[0]?.date_completed).toBe(300);
+    expect(result.items[0]?.channel_id).toBeUndefined();
+    expect(result.items[1]?.channel_id).toBe("C123");
   });
 
-  test("state 'all' returns all items", async () => {
+  test("sends the state's saved.list filter", async () => {
+    const byFilter: Record<string, Record<string, unknown>[]> = {
+      saved: [{ item_id: "C1", item_type: "message", ts: "1.1", state: "in_progress" }],
+      todo: [{ item_id: "C2", item_type: "message", ts: "2.2", state: "in_progress" }],
+      completed: [
+        {
+          item_id: "C3",
+          item_type: "message",
+          ts: "3.3",
+          state: "completed",
+          date_created: 200,
+          date_completed: 300,
+        },
+      ],
+      archived: [{ item_id: "C4", item_type: "message", ts: "4.4", state: "archived" }],
+    };
+    const { client, calls } = createClient({
+      "saved.list": (params) => ({
+        ok: true,
+        saved_items: byFilter[String(params.filter)] ?? [],
+      }),
+      "conversations.info": { ok: true, channel: { name: "test" } },
+      "conversations.history": { ok: true, messages: [] },
+    });
+    const filtersSent = () =>
+      calls.filter((c) => c.method === "saved.list").map((c) => c.params.filter);
+
+    const completed = await fetchLaterItems(client, { state: "completed" });
+    expect(filtersSent()).toEqual(["completed"]);
+    expect(completed.items.map((i) => i.channel_id)).toEqual(["C3"]);
+    expect(completed.items[0]?.date_completed).toBe(300);
+
+    calls.length = 0;
+    const inProgress = await fetchLaterItems(client);
+    expect(filtersSent()).toEqual(["saved", "todo"]);
+    expect(inProgress.items.map((i) => i.channel_id)).toEqual(["C1", "C2"]);
+
+    calls.length = 0;
+    const all = await fetchLaterItems(client, { state: "all" });
+    expect(filtersSent()).toEqual(["saved", "todo", "completed", "archived"]);
+    expect(all.items).toHaveLength(4);
+  });
+
+  test("dedupes items returned by more than one filter", async () => {
     const { client } = createClient({
       "saved.list": {
         ok: true,
-        saved_items: [
-          {
-            item_id: "C1",
-            item_type: "message",
-            ts: "1.1",
-            state: "in_progress",
-            date_created: 100,
-          },
-          { item_id: "C2", item_type: "message", ts: "2.2", state: "completed", date_created: 200 },
-        ],
-        counts: { uncompleted_count: 1, archived_count: 0, completed_count: 1, total_count: 2 },
+        saved_items: [{ item_id: "C1", item_type: "message", ts: "1.1", state: "in_progress" }],
       },
       "conversations.info": { ok: true, channel: { name: "test" } },
       "conversations.history": { ok: true, messages: [] },
     });
 
-    const result = await fetchLaterItems(client, { state: "all" });
+    const result = await fetchLaterItems(client);
 
-    expect(result.items).toHaveLength(2);
+    expect(result.items).toHaveLength(1);
   });
 
   test("respects limit", async () => {

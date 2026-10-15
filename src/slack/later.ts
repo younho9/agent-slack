@@ -1,12 +1,16 @@
 import type { SlackApiClient } from "./client.ts";
 import { renderSlackMessageContent } from "./render.ts";
+import { extractMrkdwnFromRichTextBlock } from "./render-rich-text.ts";
 
 export type LaterItem = {
-  channel_id: string;
+  item_type: string;
+  channel_id?: string;
   channel_name?: string;
-  ts: string;
+  ts?: string;
   state: string;
+  todo_state?: string;
   date_saved: number;
+  date_due?: number;
   date_completed?: number;
   message?: {
     author?: { user_id?: string; bot_id?: string };
@@ -16,10 +20,23 @@ export type LaterItem = {
   };
 };
 
+type LaterState = "in_progress" | "archived" | "completed" | "all";
+
+// saved.list returns only one bucket per call, selected by `filter`.
+// Without it, only uncompleted saved messages come back (Slack's To-dos rollout, 2026-10).
+const SAVED_LIST_FILTERS: Record<LaterState, string[]> = {
+  in_progress: ["saved", "todo"],
+  archived: ["archived"],
+  completed: ["completed"],
+  all: ["saved", "todo", "completed", "archived"],
+};
+
+const LISTED_ITEM_TYPES = new Set(["message", "reminder"]);
+
 export async function fetchLaterItems(
   client: SlackApiClient,
   options?: {
-    state?: "in_progress" | "archived" | "completed" | "all";
+    state?: LaterState;
     limit?: number;
     maxBodyChars?: number;
     countsOnly?: boolean;
@@ -28,6 +45,7 @@ export async function fetchLaterItems(
 ): Promise<{
   counts: {
     in_progress: number;
+    todo: number;
     archived: number;
     completed: number;
     total: number;
@@ -39,46 +57,60 @@ export async function fetchLaterItems(
   const limit = options?.limit ?? 20;
   const maxBodyChars = options?.maxBodyChars ?? 4000;
   const countsOnly = options?.countsOnly ?? false;
+  const filters = SAVED_LIST_FILTERS[stateFilter];
+  // A cursor belongs to a single filter's result set.
+  const singleFilter = filters.length === 1;
 
-  let currentCursor = options?.cursor;
-  let allRawItems: Record<string, unknown>[] = [];
-  let counts: Record<string, unknown> = {};
+  // `filter` already buckets by state server-side; To-do items may carry their own state values.
+  const matches = (item: Record<string, unknown>): boolean =>
+    LISTED_ITEM_TYPES.has(getString(item.item_type) ?? "");
+
+  const seen = new Set<string>();
+  const allRawItems: Record<string, unknown>[] = [];
+  let counts: Record<string, unknown> | undefined;
   let nextCursor: string | undefined;
 
-  while (true) {
-    const resp = await client.api("saved.list", {
-      limit: 50,
-      cursor: currentCursor,
-    });
+  for (const filter of filters) {
+    let currentCursor = singleFilter ? options?.cursor : undefined;
+    while (true) {
+      const resp = await client.api("saved.list", {
+        limit: 50,
+        filter,
+        cursor: currentCursor,
+      });
 
-    if (!currentCursor) {
-      counts = isRecord(resp.counts) ? resp.counts : {};
+      counts ??= isRecord(resp.counts) ? resp.counts : {};
+      if (countsOnly) {
+        break;
+      }
+
+      for (const item of asArray(resp.saved_items).filter(isRecord)) {
+        const key = `${getString(item.item_type)}:${getString(item.item_id)}:${getString(item.ts)}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          allRawItems.push(item);
+        }
+      }
+
+      const meta = isRecord(resp.response_metadata) ? resp.response_metadata : null;
+      const cursor = meta ? getString(meta.next_cursor) : undefined;
+      nextCursor = singleFilter ? cursor : undefined;
+
+      if (allRawItems.filter(matches).length >= limit || !cursor) {
+        break;
+      }
+      currentCursor = cursor;
     }
-
-    const pageRawItems = asArray(resp.saved_items).filter(isRecord);
-    allRawItems.push(...pageRawItems);
-
-    const meta = isRecord(resp.response_metadata) ? resp.response_metadata : null;
-    nextCursor = meta ? getString(meta.next_cursor) : undefined;
-
-    if (countsOnly) {
+    if (countsOnly || allRawItems.filter(matches).length >= limit) {
       break;
     }
-
-    let filtered = allRawItems.filter((item) => getString(item.item_type) === "message");
-    if (stateFilter !== "all") {
-      filtered = filtered.filter((item) => getString(item.state) === stateFilter);
-    }
-
-    if (filtered.length >= limit || !nextCursor) {
-      break;
-    }
-    currentCursor = nextCursor;
   }
 
+  counts ??= {};
   const result = {
     counts: {
       in_progress: getNumber(counts.uncompleted_count) ?? 0,
+      todo: getNumber(counts.todo_count) ?? 0,
       archived: getNumber(counts.archived_count) ?? 0,
       completed: getNumber(counts.completed_count) ?? 0,
       total: getNumber(counts.total_count) ?? 0,
@@ -91,23 +123,39 @@ export async function fetchLaterItems(
     return result;
   }
 
-  // Filter to messages only, then by state
-  let filtered = allRawItems.filter((item) => getString(item.item_type) === "message");
-  if (stateFilter !== "all") {
-    filtered = filtered.filter((item) => getString(item.state) === stateFilter);
-  }
-
-  // Limit results
-  filtered = filtered.slice(0, limit);
+  const filtered = allRawItems.filter(matches).slice(0, limit);
 
   // Hydrate items in parallel
   result.items = await Promise.all(
     filtered.map(async (item) => {
-      const channelId = getString(item.item_id) ?? "";
-      const ts = getString(item.ts) ?? "";
+      const itemType = getString(item.item_type) ?? "message";
       const state = getString(item.state) ?? "in_progress";
       const dateSaved = getNumber(item.date_created) ?? 0;
       const dateCompleted = getNumber(item.date_completed);
+      const dateDue = getNumber(item.date_due);
+      const common = {
+        item_type: itemType,
+        state,
+        todo_state: getString(item.todo_state),
+        date_saved: dateSaved,
+        date_due: dateDue && dateDue > 0 ? dateDue : undefined,
+        date_completed: dateCompleted && dateCompleted > 0 ? dateCompleted : undefined,
+      };
+
+      // Standalone To-dos (reminders) carry their text inline and have no channel.
+      if (itemType === "reminder") {
+        const content = truncate(
+          asArray(item.description).map(extractMrkdwnFromRichTextBlock).join("\n\n"),
+          maxBodyChars,
+        );
+        return {
+          ...common,
+          message: content ? { content } : undefined,
+        } satisfies LaterItem;
+      }
+
+      const channelId = getString(item.item_id) ?? "";
+      const ts = getString(item.ts) ?? "";
 
       let channelName: string | undefined;
       let message: LaterItem["message"];
@@ -156,11 +204,7 @@ export async function fetchLaterItems(
           const msgs = asArray(history.messages).filter(isRecord);
           const msg = msgs.find((m) => getString(m.ts) === ts);
           if (msg) {
-            const rendered = renderSlackMessageContent(msg);
-            const content =
-              maxBodyChars >= 0 && rendered.length > maxBodyChars
-                ? `${rendered.slice(0, maxBodyChars)}\n…`
-                : rendered;
+            const content = truncate(renderSlackMessageContent(msg), maxBodyChars);
 
             message = {
               author:
@@ -181,12 +225,10 @@ export async function fetchLaterItems(
       }
 
       return {
+        ...common,
         channel_id: channelId,
         channel_name: channelName,
         ts,
-        state,
-        date_saved: dateSaved,
-        date_completed: dateCompleted && dateCompleted > 0 ? dateCompleted : undefined,
         message,
       } satisfies LaterItem;
     }),
@@ -306,6 +348,10 @@ function getNext9am(daysFromNow: number): number {
   date.setDate(date.getDate() + daysFromNow);
   date.setHours(9, 0, 0, 0);
   return Math.floor(date.getTime() / 1000);
+}
+
+function truncate(text: string, maxChars: number): string {
+  return maxChars >= 0 && text.length > maxChars ? `${text.slice(0, maxChars)}\n…` : text;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

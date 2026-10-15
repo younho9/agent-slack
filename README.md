@@ -527,9 +527,9 @@ Output includes channels sorted by mention count, then unread count:
 
 Note: This feature uses the `client.counts` API which may be restricted in some Enterprise Grid workspaces (`team_is_restricted` error).
 
-### Later (saved messages)
+### Later (saved messages and To-dos)
 
-Manage your saved-for-later messages (Slack's Later tab):
+Manage your saved messages and To-dos (Slack's Later tab, renamed To-dos in 2026). `list` includes standalone To-dos (`item_type: "reminder"`), whose text is returned in `message.content`:
 
 ```bash
 # List saved messages (in-progress by default)
